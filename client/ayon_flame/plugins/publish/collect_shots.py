@@ -6,10 +6,6 @@ import ayon_flame.api as ayfapi
 from ayon_flame.otio import flame_export, utils
 
 from ayon_core.pipeline import PublishError
-from ayon_core.pipeline.editorial import (
-    get_media_range_with_retimes
-)
-
 
 # constatns
 NUM_PATTERN = re.compile(r"([0-9\.]+)")
@@ -128,13 +124,8 @@ class CollectShot(pyblish.api.InstancePlugin):
             file_path = clip_data["fpath"]
             first_frame = ayfapi.get_frame_from_filename(file_path) or 0
 
-            # get file path
-            head, tail = self._get_head_tail(
-                clip_data,
-                otio_clip,
-                creator_attrs["handleStart"],
-                creator_attrs["handleEnd"]
-            )
+        # get file path
+        head, tail = self._get_head_tail(otio_clip)
 
         # Make sure there is not None and negative number
         head = abs(head or 0)
@@ -164,6 +155,9 @@ class CollectShot(pyblish.api.InstancePlugin):
 
         self._get_resolution_to_data(instance.data, instance.context)
         self._inject_editorial_shared_data(instance)
+
+        instance.data["shotDurationFromSource"] = instance.data.get(
+            "retimedFramerange")
         self.log.debug(f"__ inst_data: {pformat(instance.data)}")
 
     @staticmethod
@@ -286,24 +280,10 @@ class CollectShot(pyblish.api.InstancePlugin):
                     "ayon.timeline.pixelAspect"]
             })
 
-    def _get_head_tail(self, clip_data, otio_clip, handle_start, handle_end):
+    def _get_head_tail(self, otio_clip):
         # calculate head and tail with forward compatibility
-        head = clip_data.get("segment_head")
-        tail = clip_data.get("segment_tail")
-        self.log.debug(f"__ head: `{head}`")
-        self.log.debug(f"__ tail: `{tail}`")
-
-        # HACK: it is here to serve for versions below 2021.1
-        if not any([head, tail]):
-            retimed_attributes = get_media_range_with_retimes(
-                otio_clip, handle_start, handle_end)
-            self.log.debug(f">> retimed_attributes: {retimed_attributes}")
-
-            # retimed head and tail
-            head = int(retimed_attributes["handleStart"])
-            tail = int(retimed_attributes["handleEnd"])
-
-        return head, tail
+        handles = otio_clip.metadata["handles"]
+        return handles["head"], handles["tail"]
 
     def _create_otio_time_range_from_timeline_item_data(self, clip_data):
         frame_start = int(clip_data["record_in"])

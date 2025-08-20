@@ -63,6 +63,5 @@ class CollectPlate(pyblish.api.InstancePlugin):
         version_data = instance.data.setdefault("versionData", {})
         version_data["colorSpace"] = clip_data["colour_space"]
         instance.data["colorspace"] = clip_data["colour_space"]
-
         instance.data["shotDurationFromSource"] = instance.data.get(
             "retimedFramerange")

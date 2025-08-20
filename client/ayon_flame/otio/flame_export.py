@@ -2,10 +2,13 @@
 """
 from __future__ import annotations
 
+import bisect
 import json
 import logging
+import math
 import os
 import re
+from typing import Callable
 from pprint import pformat
 
 import flame
@@ -106,6 +109,101 @@ def _get_metadata(item):
     return {}
 
 
+def mapping_curve_factory(
+        baked_map: dict[int, float]
+    ) -> Callable[[int], float]:
+    """
+    Creates a mapping function from a baked timewarp dict.
+
+    Args:
+        baked_map (dict[int, float]): 
+            { timeline_frame:int : source_frame:float }
+            Output from bake_flame_tw_setup()
+    Returns: 
+        callable[[int], float]: 
+            mapping_curve(timeline_frame) -> source_frame
+    """
+    # Sort frames for fast lookup
+    frames = sorted(baked_map.keys())
+    values = [baked_map[f] for f in frames]
+
+    def mapping_curve(timeline_frame: int) -> float:
+        """Method to extrapolate the animation curve for
+        the given frame using the timewarp data.
+
+        Args:
+            timeline_frame (int): The timewarped frame.
+
+        Returns:
+            float: The corresponding source frame.
+        """
+        # Exact match
+        if timeline_frame in baked_map:
+            return baked_map[timeline_frame]
+
+        # Before first baked frame — extrapolate linearly
+        if timeline_frame < frames[0]:
+            f0, f1 = frames[0], frames[1]
+            v0, v1 = values[0], values[1]
+            slope = (v1 - v0) / (f1 - f0)
+            return v0 + slope * (timeline_frame - f0)
+
+        # After last baked frame — extrapolate linearly
+        if timeline_frame > frames[-1]:
+            f0, f1 = frames[-2], frames[-1]
+            v0, v1 = values[-2], values[-1]
+            slope = (v1 - v0) / (f1 - f0)
+            return v1 + slope * (timeline_frame - f1)
+
+        # Between two baked frames — interpolate linearly
+        idx = bisect.bisect_left(frames, timeline_frame)
+        f0, f1 = frames[idx - 1], frames[idx]
+        v0, v1 = values[idx - 1], values[idx]
+        slope = (v1 - v0) / (f1 - f0)
+        return v0 + slope * (timeline_frame - f0)
+
+    return mapping_curve
+
+
+def calculate_unwarped_handles(
+        seg_start_tl: int, 
+        seg_end_tl: int,
+        head_handle_tl: int, 
+        tail_handle_tl: int,
+        mapping_curve: Callable[[int], float],
+    ) -> int:
+    """Calculated the unwarped frame handles using information
+    from the timeline and a mapping curve generated from a 
+    timewarp node.
+
+    Args:
+        seg_start_tl (int): Segment start frame on the timeline.
+        seg_end_tl (int): Segment end frame on the timeline.
+        head_handle_tl (int): Head handle frame on the timeline.
+        tail_handle_tl (int): Tail handle frame on the timeline.
+        mapping_curve (Callable[[int], float]): Mapping curve method
+            used to calculate the extrapolated frames.
+
+    Returns:
+        int: The extrapolated, unwarped frame number of the source media.
+    """
+    # Timeline frames including handles
+    start_with_handles_tl = seg_start_tl - head_handle_tl
+    end_with_handles_tl = seg_end_tl + tail_handle_tl
+
+    # Convert all to source frames
+    start_src = mapping_curve(start_with_handles_tl)
+    seg_start_src = mapping_curve(seg_start_tl)
+    seg_end_src = mapping_curve(seg_end_tl)
+    end_src = mapping_curve(end_with_handles_tl)
+
+    # Handle lengths in source frame space
+    head_handle_src = seg_start_src - start_src
+    tail_handle_src = end_src - seg_end_src
+
+    return math.ceil(head_handle_src), math.ceil(tail_handle_src)
+
+
 def create_time_effects(otio_clip, clip_data, speed, time_effect=None):
     otio_effect = None
 
@@ -113,9 +211,20 @@ def create_time_effects(otio_clip, clip_data, speed, time_effect=None):
     if not time_effect.is_empty:
         data = time_effect.data
 
+        segment = clip_data["PySegment"]
+        
         # Check if constant speed retiming
         if data["type"] == "speed" and data.get("numKeys") == 1:
             speed = data["speed"]
+            head = math.ceil(segment.head * abs(speed))
+            tail = math.ceil(segment.tail * abs(speed))
+            otio_clip.metadata.update(
+                {
+                    "handles": {
+                        "head": head, "tail": tail,
+                    }
+                }
+            )
 
         else:
             # Interpolate curves.
@@ -123,6 +232,20 @@ def create_time_effects(otio_clip, clip_data, speed, time_effect=None):
             tw_obj = tw_bake.Timewarp()
             iframes = tw_obj.bake_flame_tw_setup(
                 time_effect.setup_data
+            )
+            head, tail = calculate_unwarped_handles(
+                segment.record_in.relative_frame,
+                segment.record_out.relative_frame,
+                segment.head,
+                segment.tail,
+                mapping_curve_factory(iframes),
+            )
+            otio_clip.metadata.update(
+                {
+                    "handles": {
+                        "head": head, "tail": tail,
+                    }
+                }
             )
 
             # Flame TWs defines its timing offsets
@@ -489,10 +612,15 @@ def create_otio_clip(clip_data):
         OtioExportCTX.get_fps()
     )
 
+    metadata = {
+        "handles": {"head": segment.head, "tail": segment.tail}
+    }
+
     otio_clip = otio.schema.Clip(
         name=clip_data["segment_name"],
         source_range=source_range,
-        media_reference=media_reference
+        media_reference=media_reference,
+        metadata=metadata,
     )
 
     # Add markers
