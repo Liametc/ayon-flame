@@ -1,26 +1,29 @@
-import sys
-import os
-import re
+from __future__ import annotations
+
+import contextlib
+import itertools
 import json
+import os
 import pickle
-import clique
+import re
+import sys
 import tempfile
 import traceback
-import itertools
-import contextlib
 import xml.etree.cElementTree as cET
-from copy import deepcopy, copy
-from xml.etree import ElementTree as ET
+from copy import copy, deepcopy
+from dataclasses import dataclass, field
 from pprint import pformat
+from xml.etree import ElementTree as ET
 
+import clique
 from ayon_core.lib import Logger, run_subprocess
 
 from .constants import (
+    COLOR_MAP,
     MARKER_COLOR,
     MARKER_DURATION,
     MARKER_NAME,
-    COLOR_MAP,
-    MARKER_PUBLISH_DEFAULT
+    MARKER_PUBLISH_DEFAULT,
 )
 
 log = Logger.get_logger(__name__)
@@ -33,6 +36,14 @@ class CTX:
     app_framework = None
     flame_apps = []
     selection = None
+
+
+@dataclass
+class ValidationAggregator:
+    failed_segments: list = field(default_factory=list)
+
+    def has_errors(self):
+        return len(self.failed_segments) > 0
 
 
 @contextlib.contextmanager
@@ -395,9 +406,9 @@ def set_publish_attribute(segment, value):
         value (bool): True or False
     """
     tag_data = get_segment_data_marker(segment)
-    tag_data["publish"] = value
+    tag_data["active"] = value
 
-    # set data to the publish attribute
+    # set data to the active attribute
     set_segment_data_marker(segment, tag_data)
 
 
@@ -416,7 +427,7 @@ def get_publish_attribute(segment):
         set_publish_attribute(segment, MARKER_PUBLISH_DEFAULT)
         return MARKER_PUBLISH_DEFAULT
 
-    return tag_data["publish"]
+    return tag_data["active"]
 
 
 def create_segment_data_marker(segment):
@@ -532,20 +543,52 @@ def _get_shot_tokens_values(clip, tokens):
     return output
 
 
-def get_segment_attributes(segment):
-    if segment.name.get_value() == "":
+def get_segment_attributes(
+    segment, validation_aggregator: ValidationAggregator = None):
+    """Get attributes of a segment.
+
+    Args:
+        segment (Segment): Segment to get attributes from.
+        validation_aggregator (ValidationAggregator, optional):
+                Output object to store attributes for passing into
+                publishing validation. Defaults to None.
+
+    Returns:
+        dict: Dictionary of attributes.
+    """
+    if segment.type == "Gap":
         return None
+
+    if not validation_aggregator:
+        validation_aggregator = ValidationAggregator()
+
+    segment_name = segment.name.get_value()
 
     # Add timeline segment to tree
     clip_data = {
         "shot_name": segment.shot_name.get_value(),
-        "segment_name": segment.name.get_value(),
         "segment_comment": segment.comment.get_value(),
         "tape_name": segment.tape_name,
         "source_name": segment.source_name,
-        "fpath": segment.file_path,
         "PySegment": segment,
     }
+    # make sure even segments without proper name are handled as missing
+    # this way they will be detected by Publisher Validator
+    if not segment_name:
+        clip_data["segment_name"] = "Missing: Segment's Name"
+        if segment not in validation_aggregator.failed_segments:
+            validation_aggregator.failed_segments.append(segment)
+    else:
+        clip_data["segment_name"] = segment_name
+
+    # make sure even segments without file path are handled as missing
+    # this way they will be detected by Publisher Validator
+    if segment.file_path and segment_name:
+        clip_data["fpath"] = segment.file_path
+    else:
+        clip_data["segment_name"] = "Missing: Segment's File Path"
+        if segment not in validation_aggregator.failed_segments:
+            validation_aggregator.failed_segments.append(segment)
 
     # head and tail with forward compatibility
     if segment.head:
@@ -571,7 +614,8 @@ def get_segment_attributes(segment):
     # populate shot source metadata
     segment_attrs = [
         "record_duration", "record_in", "record_out",
-        "source_duration", "source_in", "source_out"
+        "source_in", "source_out", "source_frame_rate", "source_height",
+        "source_width", "source_ratio", "start_frame", "head", "tail",
     ]
     segment_attrs_data = {}
     for attr_name in segment_attrs:
@@ -583,10 +627,10 @@ def get_segment_attributes(segment):
         if attr_name in ["record_in", "record_out"]:
             clip_data[attr_name] = attr.relative_frame
         else:
-            clip_data[attr_name] = attr.frame
+            if hasattr(attr, "frame"):
+                clip_data[attr_name] = attr.frame
 
     clip_data["segment_timecodes"] = segment_attrs_data
-
     return clip_data
 
 
@@ -854,8 +898,8 @@ class MediaInfoFile(object):
 
         return xml_obj.text
 
-    def _get_collection(self, feed_basename, feed_dir, feed_ext):
-        """ Get collection string
+    def _get_collection(self, feed_basename, feed_dir, feed_ext) -> str | None:
+        """Get collection string.
 
         Args:
             feed_basename (str): file base name
@@ -869,14 +913,12 @@ class MediaInfoFile(object):
             str: collection basename with range of sequence
         """
         partialname = self._separate_file_head(feed_basename, feed_ext)
-        self.log.debug("__ partialname: {}".format(partialname))
 
         # make sure partial input basename is having correct extensoon
         if not partialname:
             raise AttributeError(
-                "Wrong input attributes. Basename - {}, Ext - {}".format(
-                    feed_basename, feed_ext
-                )
+                f"Wrong input attributes. Basename - {feed_basename}, "
+                f"Ext - {feed_ext}"
             )
 
         # get all related files
@@ -913,6 +955,7 @@ class MediaInfoFile(object):
             self.log.debug("__ coll_to_text: {}".format(coll_to_text))
             if search_number_pattern in coll_to_text:
                 return coll_to_text
+        return None
 
     @staticmethod
     def _format_collection(collection, padding=None):
@@ -1214,7 +1257,16 @@ class TimeEffectMetadata(object):
         if logger:
             self.log = logger
 
-        self._data = self._get_metadata(segment)
+        self._setup_data, self._data = self._get_metadata(segment)
+
+    @property
+    def is_empty(self):
+        """ Returns either the current object is empty or not.
+
+        Returns:
+            bool. Is the TimeEffectMetadata object empty?
+        """
+        return self._setup_data is None
 
     @property
     def data(self):
@@ -1225,6 +1277,15 @@ class TimeEffectMetadata(object):
         """
         return self._data
 
+    @property
+    def setup_data(self):
+        """ Returns timewarp effect setup data
+
+        Returns:
+            str. The XML formatted setup data.
+        """
+        return self._setup_data
+
     def _get_metadata(self, segment):
         effects = segment.effects or []
         for effect in effects:
@@ -1234,7 +1295,7 @@ class TimeEffectMetadata(object):
                     effect.save_setup(tmp_path)
                     return self._get_attributes_from_xml(tmp_path)
 
-        return {}
+        return None, {}
 
     def _get_attributes_from_xml(self, tmp_path):
         with open(tmp_path, "r") as tw_setup_file:
@@ -1262,8 +1323,11 @@ class TimeEffectMetadata(object):
                     tw_setup_state["TW_Speed"]
                     [0]["Channel"][0]["Value"][0]["_text"]
                 ) / 100
+                r_data["numKeys"] = int(
+                    tw_setup_state["TW_SpeedTiming"]
+                    [0]["Channel"][0]["Size"][0]["_text"]
+                )
             elif mode == 1:  # timewarp
-                print("timing")
                 r_data[self._retime_modes[mode]] = self._get_anim_keys(
                     tw_setup_state["TW_Timing"]
                 )
@@ -1293,9 +1357,9 @@ class TimeEffectMetadata(object):
         except Exception:
             lines = traceback.format_exception(*sys.exc_info())
             self.log.error("\n".join(lines))
-            return
+            return None, {}
 
-        return r_data
+        return tw_setup_string, r_data
 
     def _get_anim_keys(self, setup_cat, index=None):
         return_data = {

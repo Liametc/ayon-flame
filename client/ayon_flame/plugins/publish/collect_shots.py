@@ -40,6 +40,7 @@ class CollectShot(pyblish.api.InstancePlugin):
         "versionData",
         "workfileFrameStart",
         "xml_overrides",
+        "failing",
     )
 
     # TODO: add to own plugin for Flame
@@ -80,7 +81,7 @@ class CollectShot(pyblish.api.InstancePlugin):
 
         # Adjust instance data from parent otio timeline.
         otio_timeline = instance.context.data["otioTimeline"]
-        otio_clip, marker = utils.get_marker_from_clip_index(
+        otio_clip, _ = utils.get_marker_from_clip_index(
             otio_timeline, instance.data["clip_index"]
         )
         if not otio_clip:
@@ -110,21 +111,30 @@ class CollectShot(pyblish.api.InstancePlugin):
         comment_attributes = self._get_comment_attributes(segment_item)
         instance.data.update(comment_attributes)
 
-        clip_data = ayfapi.get_segment_attributes(segment_item)
-        clip_name = clip_data["segment_name"]
-        self.log.debug(f"clip_name: {clip_name}")
+        sequence = ayfapi.get_current_sequence(ayfapi.CTX.selection)
+        with ayfapi.maintained_segment_selection(sequence):
+            validation_aggregator = ayfapi.ValidationAggregator()
+            clip_data = ayfapi.get_segment_attributes(
+                segment_item, validation_aggregator=validation_aggregator)
+            clip_name = clip_data["segment_name"]
+            self.log.debug(f"clip_name: {clip_name}")
 
         # get file path
-        file_path = clip_data["fpath"]
-        first_frame = ayfapi.get_frame_from_filename(file_path) or 0
+        file_path = None
+        first_frame = 0
+        head = 0
+        tail = 0
+        if not validation_aggregator.has_errors():
+            file_path = clip_data["fpath"]
+            first_frame = ayfapi.get_frame_from_filename(file_path) or 0
 
-        # get file path
-        head, tail = self._get_head_tail(
-            clip_data,
-            otio_clip,
-            creator_attrs["handleStart"],
-            creator_attrs["handleEnd"]
-        )
+            # get file path
+            head, tail = self._get_head_tail(
+                clip_data,
+                otio_clip,
+                creator_attrs["handleStart"],
+                creator_attrs["handleEnd"]
+            )
 
         # Make sure there is not None and negative number
         head = abs(head or 0)
@@ -142,6 +152,7 @@ class CollectShot(pyblish.api.InstancePlugin):
         instance.data.update({
             "item": segment_item,
             "path": file_path,
+            "failing": validation_aggregator.has_errors(),
             "sourceFirstFrame": int(first_frame),
             "workfileFrameStart": workfile_start,
             "flameAddTasks": self.add_tasks,
@@ -254,7 +265,7 @@ class CollectShot(pyblish.api.InstancePlugin):
         assert data.get("otioClip"), "Missing `otioClip` data"
 
         # solve source resolution option
-        if data.get("sourceResolution", None):
+        if data["creator_attributes"].get("useSourceResolution", None):
             otio_clip_metadata = data[
                 "otioClip"].media_reference.metadata
             data.update({

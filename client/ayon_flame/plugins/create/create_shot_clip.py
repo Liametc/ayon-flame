@@ -3,11 +3,15 @@ import uuid
 
 import ayon_flame.api as ayfapi
 from ayon_flame.api import plugin, lib, pipeline
-from ayon_flame.otio import flame_export
 
 from ayon_core.pipeline.create import CreatorError, CreatedInstance
 from ayon_core.lib import BoolDef, EnumDef, TextDef, UILabelDef, NumberDef
 
+try:
+    from ayon_core.pipeline.create import ParentFlags
+except ImportError:
+    # Parenting was added with 'https://github.com/ynput/ayon-core/pull/1395'
+    ParentFlags = None
 
 # Used as a key by the creators in order to
 # retrieve the instances data into clip markers.
@@ -107,6 +111,17 @@ class _FlameInstanceCreator(plugin.HiddenFlameCreator):
     """Wrapper class for clip types products.
     """
 
+    def _add_instance_to_context(self, instance):
+        parent_id = instance.get("parent_instance_id")
+        if parent_id is not None and ParentFlags is not None:
+            instance.set_parent(
+                parent_id,
+                # Disable if a parent is disabled and delete if a parent
+                #   is deleted
+                ParentFlags.share_active | ParentFlags.parent_lifetime
+            )
+        super()._add_instance_to_context(instance)
+
     def create(self, instance_data, _):
         """Return a new CreateInstance for new shot from Flame.
 
@@ -196,7 +211,15 @@ class FlameShotInstanceCreator(_FlameInstanceCreator):
     label = "Editorial Shot"
 
     def get_instance_attr_defs(self):
-        instance_attributes = CLIP_ATTR_DEFS
+        instance_attributes = list(CLIP_ATTR_DEFS)
+        instance_attributes.append(
+            BoolDef(
+                "useSourceResolution",
+                label="Set shot resolution from plate",
+                tooltip="Is resolution taken from timeline or source?",
+                default=False,
+            )
+        )
         return instance_attributes
 
 
@@ -232,8 +255,9 @@ class _FlameInstanceClipCreatorBase(_FlameInstanceCreator):
             instance.set_create_attr_defs(attr_defs)
 
     def get_attr_defs_for_instance(self, instance):
-
+        parent_instance = instance.creator_attributes.get("parent_instance")
         current_sequence = lib.get_current_sequence(lib.CTX.selection)
+
         if current_sequence is not None:
             gui_tracks = [
                 {"value": tr_name, "label": f"Track: {tr_name}"}
@@ -247,7 +271,8 @@ class _FlameInstanceClipCreatorBase(_FlameInstanceCreator):
                 "parentInstance",
                 label="Linked to",
                 disabled=True,
-            )
+                default=parent_instance,
+            ),
         ]
 
         if self.product_type == "plate":
@@ -665,8 +690,13 @@ OTIO file.
 
                 # Shot creation
                 if creator_id == shot_creator_id:
-                    segment_data = flame_export.get_segment_attributes(segment)
-                    segment_duration = int(segment_data["record_duration"])
+                    segment_data = lib.get_segment_attributes(segment)
+                    self.log.debug(f"segment_data: '{segment_data}'")
+                    record_in = segment_data["record_in"]
+                    record_out = segment_data["record_out"]
+                    segment_duration = segment_data.get("record_duration")
+                    if segment_duration is None:
+                        segment_duration = record_out - record_in + 1
                     workfileFrameStart = sub_instance_data[
                         "workfileFrameStart"]
                     sub_instance_data.update(
@@ -682,8 +712,8 @@ OTIO file.
                                 "frameStart": workfileFrameStart,
                                 "frameEnd": (
                                     workfileFrameStart + segment_duration),
-                                "clipIn": int(segment_data["record_in"]),
-                                "clipOut": int(segment_data["record_out"]),
+                                "clipIn": int(record_in),
+                                "clipOut": int(record_out),
                                 "clipDuration": segment_duration,
                                 "sourceIn": int(segment_data["source_in"]),
                                 "sourceOut": int(segment_data["source_out"]),
@@ -694,6 +724,8 @@ OTIO file.
                                 "retimedFramerange": pre_create_data[
                                     "retimedFramerange"
                                 ],
+                                "useSourceResolution": sub_instance_data[
+                                    "sourceResolution"],
                             },
                             "label": f"{shot_folder_path} shot",
                         }
@@ -752,7 +784,6 @@ OTIO file.
 
                 instance = creator.create(sub_instance_data, None)
                 instance.transient_data["segment_item"] = segment
-                self._add_instance_to_context(instance)
 
                 instance_data_to_store = instance.data_to_store()
                 shot_instances[creator_id] = instance_data_to_store
@@ -787,7 +818,6 @@ OTIO file.
         creator = self.create_context.creators[creator_id]
         instance = creator.create(data, None)
         instance.transient_data["segment_item"] = segment
-        self._add_instance_to_context(instance)
         instances.append(instance)
         return instance
 
@@ -810,7 +840,7 @@ OTIO file.
 
         # Create parent shot instance.
         sub_instance_data = instance_data.copy()
-        segment_data = flame_export.get_segment_attributes(segment)
+        segment_data = lib.get_segment_attributes(segment)
         segment_duration = int(segment_data["record_duration"])
         workfileFrameStart = sub_instance_data["workfileFrameStart"]
         sub_instance_data.update({
@@ -829,6 +859,7 @@ OTIO file.
                 "includeHandles": sub_instance_data["includeHandles"],
                 "retimedHandles": sub_instance_data["retimedHandles"],
                 "retimedFramerange": sub_instance_data["retimedFramerange"],
+                "useSourceResolution": sub_instance_data["sourceResolution"],
             },
             "label": (
                 f"{sub_instance_data['folderPath']} shot"
@@ -839,7 +870,6 @@ OTIO file.
         creator = self.create_context.creators[shot_creator_id]
         instance = creator.create(sub_instance_data, None)
         instance.transient_data["segment_item"] = segment
-        self._add_instance_to_context(instance)
         clip_instances[shot_creator_id] = instance.data_to_store()
         parenting_data = instance
 
@@ -874,7 +904,6 @@ OTIO file.
 
             instance = creator.create(sub_instance_data, None)
             instance.transient_data["segment_item"] = segment
-            self._add_instance_to_context(instance)
             clip_instances[sub_creator_id] = instance.data_to_store()
 
         # Adjust clip tag to match new publisher
@@ -889,9 +918,24 @@ OTIO file.
 
     def collect_instances(self):
         """Collect all created instances from current timeline."""
-        current_sequence = lib.get_current_sequence(lib.CTX.selection)
+        # get selection only of sequence clip segments
+        create_settings = self.project_settings[
+            "flame"]["create"]["CollectShotClip"]
+        restrict_to_selection = create_settings[
+            "collectSelectedInstance"]
 
-        for segment in lib.get_sequence_segments(current_sequence):
+        current_sequence = lib.get_current_sequence(lib.CTX.selection)
+        # only get selected segments if user selected any
+        # and settings are enabled
+        segments = lib.get_sequence_segments(
+            current_sequence, selected=restrict_to_selection
+        )
+
+        if not segments:
+            # get all segments if user didn't select any
+            segments = lib.get_sequence_segments(current_sequence)
+
+        for segment in segments:
             instances = []
 
             # attempt to get AYON tag data
